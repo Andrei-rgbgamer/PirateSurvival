@@ -4,7 +4,7 @@ local RunService = game:GetService("RunService")
 local Terrain = workspace.Terrain
 
 -- ?? Chunk settings
-local CHUNK_SIZE = 512
+local CHUNK_SIZE = 256
 local LOAD_RADIUS = 5 -- number of chunks around player to load
 
 -- ?? Island settings
@@ -133,7 +133,7 @@ local function pickIslandType(seedX, seedZ)
 	end
 end
 
--- ?? Mountainous generator — dome + central peaks + shoreline bays
+-- ?? Mountainous generator (scaled peaks by island size)
 local function generateMountainous(seedX, seedZ, sizeX, sizeZ, markerBaseY, rng)
 	return coroutine.create(function()
 		rng = rng or Random.new(worldSeed + seedX * 73856093 + seedZ * 19349663 + 20000)
@@ -142,56 +142,45 @@ local function generateMountainous(seedX, seedZ, sizeX, sizeZ, markerBaseY, rng)
 		local baseZ = seedZ * CHUNK_SIZE
 		local width = sizeX * CHUNK_SIZE
 		local depth = sizeZ * CHUNK_SIZE
-
 		local centerX = baseX + width * 0.5
 		local centerZ = baseZ + depth * 0.5
 
-		-- ===== Tunables =====
-		local SHORE_FRACTION     = 0.32
-		local DOME_HEIGHT        = 36
-		local MOUNTAIN_BOOST_MIN = 60
-		local MOUNTAIN_BOOST_MAX = 150
-		local MAX_PEAK_LIMIT     = 340
-		local NOISE_BIG_AMPL     = 20
-		local NOISE_DETAIL_AMPL  = 10
-		local SNOW_TOP_FRACTION  = 0.12
-		local OVERSHOOT          = VOXEL_STEP * 2
-		-- ====================
+		-- scale factor based on average island radius
+		local avgRadius = (width + depth) * 0.25
+		local sizeScale = clamp(avgRadius / 256, 0.5, 2.5) 
+		-- 256 = baseline size (tweak), scale mountains between half and 2.5Ã—
 
-		local radiusX = math.max(1, width * 0.5)
-		local radiusZ = math.max(1, depth * 0.5)
-		local islandRadius = math.min(radiusX, radiusZ)
+		-- ===== CONFIG (scaled) =====
+		local OVERSHOOT       = VOXEL_STEP * 2
+		local MOUNTAIN_NORM   = 0.30
+		local GRASS_NORM      = 0.80
+		local SAND_HEIGHT     = rng:NextInteger(1, 2)
 
-		-- Peaks (center bump or short range)
-		local peaks = {}
-		if rng:NextNumber() < 0.75 then
-			table.insert(peaks, {
-				x = centerX + rng:NextNumber(-islandRadius * 0.08, islandRadius * 0.08),
-				z = centerZ + rng:NextNumber(-islandRadius * 0.08, islandRadius * 0.08),
-				radius = islandRadius * (0.28 + rng:NextNumber() * 0.18),
-				strength = rng:NextNumber(MOUNTAIN_BOOST_MIN, MOUNTAIN_BOOST_MAX)
+		local GRASS_RISE      = 22 * sizeScale
+		local MOUNTAIN_LIFT   = (80 + rng:NextInteger(-10, 25)) * sizeScale
+		local RIDGE_AMPL      = 14 * sizeScale
+		local DETAIL_AMPL     = 6 * sizeScale
+		local MAX_PEAK_OFFSET = 380 * sizeScale
+		-- ============================
+
+		-- bays
+		local cutouts = {}
+		for i = 1, rng:NextInteger(0, 2) do
+			table.insert(cutouts, {
+				x = centerX + rng:NextNumber(-width * 0.22, width * 0.22),
+				z = centerZ + rng:NextNumber(-depth * 0.22, depth * 0.22),
+				radius = math.min(width, depth) * (0.10 + rng:NextNumber() * 0.20)
 			})
-		else
-			local count = rng:NextInteger(2, 3)
-			for i = 1, count do
-				table.insert(peaks, {
-					x = centerX + rng:NextNumber(-islandRadius * 0.2, islandRadius * 0.2),
-					z = centerZ + rng:NextNumber(-islandRadius * 0.2, islandRadius * 0.2),
-					radius = islandRadius * rng:NextNumber(0.18, 0.28),
-					strength = rng:NextNumber(MOUNTAIN_BOOST_MIN * 0.6, MOUNTAIN_BOOST_MAX * 0.9)
-				})
-			end
 		end
 
-		-- Bays (cutouts)
-		local bays = {}
-		local bayCount = rng:NextInteger(1, 3)
-		for i = 1, bayCount do
-			table.insert(bays, {
-				x = centerX + rng:NextNumber(-radiusX * 0.7, radiusX * 0.7),
-				z = centerZ + rng:NextNumber(-radiusZ * 0.7, radiusZ * 0.7),
-				radius = islandRadius * rng:NextNumber(0.18, 0.28),
-				depth = rng:NextNumber(12, 22) -- how deep the bay cuts in
+		-- peaks (scaled radius)
+		local peaks = {}
+		local peakCount = (rng:NextNumber() < 0.75) and 1 or rng:NextInteger(2, 3)
+		for i = 1, peakCount do
+			table.insert(peaks, {
+				x = centerX + rng:NextNumber(-width*0.14, width*0.14),
+				z = centerZ + rng:NextNumber(-depth*0.14, depth*0.14),
+				radius = avgRadius * rng:NextNumber(0.18, 0.28) -- scaled peak footprint
 			})
 		end
 
@@ -201,73 +190,194 @@ local function generateMountainous(seedX, seedZ, sizeX, sizeZ, markerBaseY, rng)
 				local wx = baseX + localX
 				local wz = baseZ + localZ
 
-				local nx = (localX - width * 0.5) / radiusX
-				local nz = (localZ - depth * 0.5) / radiusZ
-				local radial = math.sqrt(nx * nx + nz * nz)
-				local edgeFall = smoothstep(clamp(radial, 0, 1))
+				local nx = (wx - centerX) / math.max(1, width*0.5)
+				local nz = (wz - centerZ) / math.max(1, depth*0.5)
+				local radial = math.sqrt(nx*nx + nz*nz)
 
-				if edgeFall < 1.0 then
-					-- Base dome
-					local domeFactor = (1 - edgeFall)
-					local domeHeight = DOME_HEIGHT * (domeFactor ^ 1.6)
-					local baseHeight = WATER_LEVEL + domeHeight * 0.9
+				local shapeN = dnoise(wx * 0.0009, wz * 0.0009, worldSeed * 0.12) * 0.08
+				local radialNoisy = clamp(radial + shapeN, 0, 1)
+				local edgeFall = smoothstep(radialNoisy)
 
-					-- Shore flatten
-					if edgeFall > (1 - SHORE_FRACTION) then
-						local shoreBias = (1 - edgeFall) / SHORE_FRACTION
-						baseHeight = WATER_LEVEL + domeHeight * (0.25 * shoreBias)
-					end
+				if edgeFall < 1.05 then
+					local baseHeight = markerBaseY + GRASS_RISE * (1 - edgeFall) ^ 1.3
 
-					-- Apply bays
-					for _, bay in ipairs(bays) do
-						local dx, dz = wx - bay.x, wz - bay.z
-						local dist = math.sqrt(dx * dx + dz * dz)
-						if dist < bay.radius then
-							baseHeight = baseHeight - (1 - smoothstep(dist / bay.radius)) * bay.depth
+					for _, cut in ipairs(cutouts) do
+						local dx, dz = wx - cut.x, wz - cut.z
+						local dist = math.sqrt(dx*dx + dz*dz)
+						if dist < cut.radius then
+							baseHeight = baseHeight - (1 - smoothstep(dist / cut.radius)) * (6 + rng:NextNumber()*8)
 						end
 					end
 
-					-- Peaks
-					if edgeFall < (1 - SHORE_FRACTION * 0.2) then
-						for _, p in ipairs(peaks) do
-							local dx, dz = wx - p.x, wz - p.z
-							local d = math.sqrt(dx * dx + dz * dz)
-							local g = math.exp(-0.5 * (d * d) / (p.radius * p.radius))
-							baseHeight = baseHeight + g * p.strength * (0.9 * domeFactor + 0.1)
-						end
+					local mountainInfluence = 0
+					if radialNoisy <= MOUNTAIN_NORM then
+						mountainInfluence = clamp((MOUNTAIN_NORM - radialNoisy) / (MOUNTAIN_NORM + 1e-6), 0, 1)
+						mountainInfluence = smoothstep(mountainInfluence)
 					end
 
-					-- Noise
-					local bigNoise = dnoise(wx * 0.0012, wz * 0.0012, worldSeed * 0.11) * NOISE_BIG_AMPL
-					local detailNoise = dnoise(wx * 0.006, wz * 0.006, worldSeed * 0.27) * NOISE_DETAIL_AMPL
-					local finalHeight = baseHeight + (bigNoise + detailNoise)
-					finalHeight = math.min(finalHeight, WATER_LEVEL + MAX_PEAK_LIMIT)
+					local peakBoost = 0
+					if mountainInfluence > 0 then
+						for _, peak in ipairs(peaks) do
+							local dx, dz = wx - peak.x, wz - peak.z
+							local pdist = math.sqrt(dx*dx + dz*dz)
+							local g = math.exp(-(pdist*pdist) / (2 * (peak.radius * peak.radius + 1e-6)))
+							peakBoost = peakBoost + g
+						end
+						peakBoost = peakBoost * MOUNTAIN_LIFT * mountainInfluence
+					end
 
-					-- Fill terrain
+					local ridge = math.abs(dnoise(wx*0.0025, wz*0.006, worldSeed*0.42)) * RIDGE_AMPL * mountainInfluence
+					local detail = dnoise(wx*0.01, wz*0.01, worldSeed*0.88) * DETAIL_AMPL * mountainInfluence
+
+					local finalHeight = baseHeight + peakBoost + ridge + detail
+					finalHeight = math.min(finalHeight, markerBaseY + MAX_PEAK_OFFSET)
+
 					if finalHeight > markerBaseY + 0.25 then
-						local heightSpan = finalHeight - markerBaseY
-						local snowStart = finalHeight - heightSpan * SNOW_TOP_FRACTION
-						local startY = math.floor((WATER_LEVEL - (DOME_HEIGHT * 0.35)) / VOXEL_STEP) * VOXEL_STEP
+						local startY = math.floor(markerBaseY / VOXEL_STEP) * VOXEL_STEP
 						if startY > markerBaseY then startY = markerBaseY end
 
 						for y = startY, finalHeight, VOXEL_STEP do
 							local mat
-							if y <= WATER_LEVEL and y <= markerBaseY + 2 then
+							if y <= markerBaseY + SAND_HEIGHT and radialNoisy > GRASS_NORM then
 								mat = Enum.Material.Sand
-							elseif y <= WATER_LEVEL + (DOME_HEIGHT * 0.25) then
-								local dd = dnoise(wx * 0.02, wz * 0.02, worldSeed * 0.33)
-								mat = (dd > 0.15) and Enum.Material.LeafyGrass or Enum.Material.Grass
+							elseif radialNoisy <= MOUNTAIN_NORM and mountainInfluence > 0.15 and y > markerBaseY + GRASS_RISE * 0.35 then
+								local rnd = dnoise(wx*0.02, wz*0.02, worldSeed*0.33)
+								mat = (rnd > 0.18) and Enum.Material.Rock or Enum.Material.LeafyGrass
+							elseif radialNoisy <= GRASS_NORM then
+								local rnd = dnoise(wx*0.02, wz*0.02, worldSeed*0.33)
+								mat = (rnd > -0.05) and Enum.Material.LeafyGrass or Enum.Material.Grass
 							else
-								mat = (y >= snowStart) and Enum.Material.Snow or Enum.Material.Rock
+								mat = Enum.Material.Sand
 							end
-
 							Terrain:FillBlock(CFrame.new(wx, y, wz), Vector3.new(VOXEL_STEP, VOXEL_STEP, VOXEL_STEP), mat)
 						end
 					end
 				end
 
-				ops += 1
+				ops = ops + 1
 				if ops % 350 == 0 then coroutine.yield() end
+			end
+		end
+	end)
+end
+
+-- ---- Plateau generator (flat grassy w/ scattered small bumps; materials anchored to markerBaseY)
+local function generatePlateau(seedX, seedZ, sizeX, sizeZ, markerBaseY, rng)
+	return coroutine.create(function()
+		rng = rng or Random.new(worldSeed + seedX * 73856093 + seedZ * 19349663 + 61000)
+
+		local baseX = seedX * CHUNK_SIZE
+		local baseZ = seedZ * CHUNK_SIZE
+		local width = sizeX * CHUNK_SIZE
+		local depth = sizeZ * CHUNK_SIZE
+		local centerX = baseX + width * 0.5
+		local centerZ = baseZ + depth * 0.5
+
+		-- Tunables (verticals relative to markerBaseY)
+		local SAND_HEIGHT     = 2
+		local MID_HEIGHT_OFF  = 18 + rng:NextInteger(-3, 6) -- plateau top above marker
+		local NOISE_AMPL      = 4
+		local BUMP_COUNT_MIN  = 3
+		local BUMP_COUNT_MAX  = 7
+		local BUMP_AMPL       = 8
+		local OVERSHOOT       = VOXEL_STEP * 2
+
+		local MID_HEIGHT = markerBaseY + MID_HEIGHT_OFF
+
+		-- many small bumps
+		local bumps = {}
+		local bumpCount = rng:NextInteger(BUMP_COUNT_MIN, BUMP_COUNT_MAX)
+		for i = 1, bumpCount do
+			table.insert(bumps, {
+				x = centerX + rng:NextNumber(-width * 0.35, width * 0.35),
+				z = centerZ + rng:NextNumber(-depth * 0.35, depth * 0.35),
+				radius = math.min(width, depth) * rng:NextNumber(0.06, 0.16),
+				ampl = BUMP_AMPL * (0.6 + rng:NextNumber()*0.9)
+			})
+		end
+
+		-- minor cutouts
+		local cutouts = {}
+		for i = 1, rng:NextInteger(0, 1) do
+			table.insert(cutouts, {
+				x = centerX + rng:NextNumber(-width * 0.22, width * 0.22),
+				z = centerZ + rng:NextNumber(-depth * 0.22, depth * 0.22),
+				radius = math.min(width, depth) * (0.12 + rng:NextNumber() * 0.18)
+			})
+		end
+
+		local ops = 0
+		for localX = -OVERSHOOT, width + OVERSHOOT, VOXEL_STEP do
+			for localZ = -OVERSHOOT, depth + OVERSHOOT, VOXEL_STEP do
+				local wx = baseX + localX
+				local wz = baseZ + localZ
+
+				local nx = (wx - centerX) / (width * 0.5)
+				local nz = (wz - centerZ) / (depth * 0.5)
+				local radial = math.sqrt(nx*nx + nz*nz)
+				local edgeFall = smoothstep(clamp(radial, 0, 1))
+
+				if edgeFall < 1.0 then
+					-- base slope anchored to markerBaseY (no WATER_LEVEL)
+					local baseHeight = markerBaseY + (MID_HEIGHT - markerBaseY) * (1 - edgeFall)^1.6
+
+					-- cutout depressions
+					for _, cut in ipairs(cutouts) do
+						local dx, dz = wx - cut.x, wz - cut.z
+						local dist = math.sqrt(dx*dx + dz*dz)
+						if dist < cut.radius then
+							baseHeight = baseHeight - (1 - smoothstep(dist / cut.radius)) * (4 + rng:NextNumber()*6)
+						end
+					end
+
+					-- bump contributions
+					local bumpBoost = 0
+					for _, b in ipairs(bumps) do
+						local dx, dz = wx - b.x, wz - b.z
+						local pd = math.sqrt(dx*dx + dz*dz)
+						local g = math.exp(-(pd*pd) / (2 * (b.radius*b.radius)))
+						bumpBoost = bumpBoost + g * b.ampl
+					end
+
+					-- erosion and small rolling bumps
+					local erosion = dnoise(wx * 0.02, wz * 0.02, worldSeed * 0.5) * (edgeFall * 6)
+					baseHeight = baseHeight - erosion
+					local noiseBump = dnoise(wx*0.004, wz*0.004, worldSeed*0.44) * NOISE_AMPL
+					local finalHeight = baseHeight + bumpBoost + noiseBump
+
+					if finalHeight > markerBaseY + 0.2 then
+						local shoreBand = rng:NextInteger(1, math.max(1, SAND_HEIGHT))
+						local startY = math.floor(markerBaseY / VOXEL_STEP) * VOXEL_STEP
+						if startY > markerBaseY then startY = markerBaseY end
+
+						for y = startY, finalHeight, VOXEL_STEP do
+							local mat
+							-- sand anchored to markerBaseY
+							if y <= markerBaseY + shoreBand then
+								mat = Enum.Material.Sand
+								-- leafy-grass dominated plateau top
+							elseif y <= finalHeight - 2 then
+								local d = dnoise(wx*0.02, wz*0.02, worldSeed*0.3)
+								mat = (d > -0.08) and Enum.Material.LeafyGrass or Enum.Material.Grass
+							else
+								-- small scattered rocks at some bump peaks
+								local rockChance = dnoise(wx*0.03, wz*0.03, worldSeed*0.6) + (bumpBoost * 0.02)
+								if rockChance > 0.22 and y > MID_HEIGHT + 4 then
+									mat = Enum.Material.Rock
+								else
+									mat = Enum.Material.Grass
+								end
+							end
+
+							Terrain:FillBlock(CFrame.new(wx, y, wz),
+								Vector3.new(VOXEL_STEP, VOXEL_STEP, VOXEL_STEP),
+								mat)
+						end
+					end
+				end
+
+				ops = ops + 1
+				if ops % 300 == 0 then coroutine.yield() end
 			end
 		end
 	end)
@@ -346,95 +456,6 @@ local function generateBeachy(seedX, seedZ, sizeX, sizeZ, markerBaseY, rng)
 							end
 
 							Terrain:FillBlock(CFrame.new(wx, y, wz), Vector3.new(VOXEL_STEP, VOXEL_STEP, VOXEL_STEP), mat)
-						end
-					end
-				end
-			end
-			coroutine.yield()
-		end
-	end)
-end
-
--- ---- Plateau generator (flat grassy w/ scattered bumps) ----
-local function generatePlateau(seedX, seedZ, sizeX, sizeZ, markerBaseY, rng)
-	return coroutine.create(function()
-		rng = rng or Random.new(worldSeed + seedX * 73856093 + seedZ * 19349663 + 60000)
-
-		local baseX = seedX * CHUNK_SIZE
-		local baseZ = seedZ * CHUNK_SIZE
-		local width = sizeX * CHUNK_SIZE
-		local depth = sizeZ * CHUNK_SIZE
-		local centerX = baseX + width * 0.5
-		local centerZ = baseZ + depth * 0.5
-
-		-- Tunables
-		local SHORE_BAND_MAX   = 3
-		local MID_HEIGHT       = WATER_LEVEL + 22 + rng:NextInteger(-4, 6) -- lower & flatter
-		local NOISE_AMPL       = 10  -- just little undulations
-		local ROCK_THRESHOLD   = 0.55 -- chance for rock bumps
-		local OVERSHOOT        = VOXEL_STEP * 2
-
-		-- cutouts (still allow bays/ponds)
-		local cutouts = {}
-		for i = 1, rng:NextInteger(0,1) do
-			table.insert(cutouts, {
-				x = centerX + rng:NextNumber(-width * 0.25, width * 0.25),
-				z = centerZ + rng:NextNumber(-depth * 0.25, depth * 0.25),
-				radius = math.min(width, depth) * (0.14 + rng:NextNumber() * 0.22)
-			})
-		end
-
-		for localX = -OVERSHOOT, width + OVERSHOOT, VOXEL_STEP do
-			for localZ = -OVERSHOOT, depth + OVERSHOOT, VOXEL_STEP do
-				local wx = baseX + localX
-				local wz = baseZ + localZ
-
-				local nx = (localX - width*0.5) / math.max(1, width * 0.5)
-				local nz = (localZ - depth*0.5) / math.max(1, depth * 0.5)
-				local radial = math.sqrt(nx*nx + nz*nz)
-				local edgeFall = smoothstep(clamp(radial, 0, 1))
-
-				if edgeFall < 1.0 then
-					-- base slope toward water
-					local baseHeight = markerBaseY + (WATER_LEVEL - markerBaseY) * (1 - edgeFall)^1.6
-
-					-- cutouts for bays
-					for _, cut in ipairs(cutouts) do
-						local dx, dz = wx - cut.x, wz - cut.z
-						local dist = math.sqrt(dx*dx + dz*dz)
-						if dist < cut.radius then
-							baseHeight -= (1 - smoothstep(dist / cut.radius)) * 8
-						end
-					end
-
-					-- mostly flat top, with little rolling bumps
-					local noiseBump = dnoise(wx*0.005, wz*0.005, worldSeed*0.44) * NOISE_AMPL
-					local finalHeight = baseHeight + (MID_HEIGHT - markerBaseY) * (1 - edgeFall) + noiseBump
-
-					if finalHeight > markerBaseY + 0.5 then
-						local shoreBand = rng:NextInteger(1, SHORE_BAND_MAX)
-						local startY = math.floor(markerBaseY / VOXEL_STEP) * VOXEL_STEP
-						if startY > markerBaseY then startY = markerBaseY end
-
-						for y = startY, finalHeight, VOXEL_STEP do
-							local mat
-							if y <= WATER_LEVEL and y <= markerBaseY + shoreBand then
-								mat = Enum.Material.Sand
-							elseif y <= MID_HEIGHT then
-								-- mostly leafy grass with some grass
-								local d = dnoise(wx*0.02, wz*0.02, worldSeed*0.3)
-								mat = (d > -0.2) and Enum.Material.LeafyGrass or Enum.Material.Grass
-							else
-								-- scattered rock bumps, not a peak
-								local r = dnoise(wx*0.04, wz*0.04, worldSeed*0.66)
-								mat = (r > ROCK_THRESHOLD) and Enum.Material.Rock or Enum.Material.LeafyGrass
-							end
-
-							Terrain:FillBlock(
-								CFrame.new(wx, y, wz),
-								Vector3.new(VOXEL_STEP, VOXEL_STEP, VOXEL_STEP),
-								mat
-							)
 						end
 					end
 				end
